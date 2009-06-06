@@ -21,22 +21,35 @@
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #++
 
+require 'openssl'
 require 'net/http'
 require 'hpricot'
 require 'cgi'
+require 'base64'
 
 module Amazon
   class RequestError < StandardError; end
-  
+
   class Ecs
-    SERVICE_URLS = {:us => 'http://webservices.amazon.com/onca/xml?Service=AWSECommerceService',
-        :uk => 'http://webservices.amazon.co.uk/onca/xml?Service=AWSECommerceService',
-        :ca => 'http://webservices.amazon.ca/onca/xml?Service=AWSECommerceService',
-        :de => 'http://webservices.amazon.de/onca/xml?Service=AWSECommerceService',
-        :jp => 'http://webservices.amazon.co.jp/onca/xml?Service=AWSECommerceService',
-        :fr => 'http://webservices.amazon.fr/onca/xml?Service=AWSECommerceService'
+    SERVICE_URLS = {
+      :us => 'http://webservices.amazon.com/onca/xml?Service=AWSECommerceService',
+      :uk => 'http://webservices.amazon.co.uk/onca/xml?Service=AWSECommerceService',
+      :ca => 'http://webservices.amazon.ca/onca/xml?Service=AWSECommerceService',
+      :de => 'http://webservices.amazon.de/onca/xml?Service=AWSECommerceService',
+      :jp => 'http://webservices.amazon.co.jp/onca/xml?Service=AWSECommerceService',
+      :fr => 'http://webservices.amazon.fr/onca/xml?Service=AWSECommerceService'
     }
-    
+    SERVICE_DOMAINS = {
+      :us => 'webservices.amazon.com',
+      :uk => 'webservices.amazon.co.uk',
+      :ca => 'webservices.amazon.ca',
+      :de => 'webservices.amazon.de',
+      :jp => 'webservices.amazon.co.jp',
+      :fr => 'webservices.amazon.fr'
+    }
+    SERVICE_PATH  = "/onca/xml"
+    DEFAULT_QUERY = "Service=AWSECommerceService"
+
     @@options = {}
     @@debug = false
 
@@ -44,40 +57,40 @@ module Amazon
     def self.options
       @@options
     end
-    
+
     # Set default search options
     def self.options=(opts)
       @@options = opts
     end
-    
+
     # Get debug flag.
     def self.debug
       @@debug
     end
-    
+
     # Set debug flag to true or false.
     def self.debug=(dbg)
       @@debug = dbg
     end
-    
+
     def self.configure(&proc)
       raise ArgumentError, "Block is required." unless block_given?
       yield @@options
     end
-    
+
     # Search amazon items with search terms. Default search index option is 'Books'.
     # For other search type other than keywords, please specify :type => [search type param name].
     def self.item_search(terms, opts = {})
       opts[:operation] = 'ItemSearch'
       opts[:search_index] = opts[:search_index] || 'Books'
-      
+
       type = opts.delete(:type)
-      if type 
+      if type
         opts[type.to_sym] = terms
-      else 
+      else
         opts[:keywords] = terms
       end
-      
+
       self.send_request(opts)
     end
 
@@ -85,16 +98,16 @@ module Amazon
     def self.item_lookup(item_id, opts = {})
       opts[:operation] = 'ItemLookup'
       opts[:item_id] = item_id
-      
+
       self.send_request(opts)
-    end    
-          
+    end
+
     # Generic send request to ECS REST service. You have to specify the :operation parameter.
     def self.send_request(opts)
       opts = self.options.merge(opts) if self.options
       request_url = prepare_url(opts)
       log "Request URL: #{request_url}"
-      
+
       res = Net::HTTP.get_response(URI::parse(request_url))
       unless res.kind_of? Net::HTTPSuccess
         raise Amazon::RequestError, "HTTP Response: #{res.code} #{res.message}"
@@ -128,12 +141,12 @@ module Amazon
       def error
         Element.get(@doc, "error/message")
       end
-      
+
       # Return error code
       def error_code
         Element.get(@doc, "error/code")
       end
-      
+
       # Return an array of Amazon::Element item objects.
       def items
         unless @items
@@ -141,12 +154,12 @@ module Amazon
         end
         @items
       end
-      
+
       # Return the first item (Amazon::Element)
       def first_item
         items.first
       end
-      
+
       # Return current page no if :item_page option is when initiating the request.
       def item_page
         unless @item_page
@@ -162,7 +175,7 @@ module Amazon
         end
         @total_results
       end
-      
+
       # Return total pages.
       def total_pages
         unless @total_pages
@@ -171,38 +184,47 @@ module Amazon
         @total_pages
       end
     end
-    
+
     protected
-      def self.log(s)
-        return unless self.debug
-        if defined? RAILS_DEFAULT_LOGGER
-          RAILS_DEFAULT_LOGGER.error(s)
-        elsif defined? LOGGER
-          LOGGER.error(s)
-        else
-          puts s
-        end
+    def self.log(s)
+      return unless self.debug
+      if defined? RAILS_DEFAULT_LOGGER
+        RAILS_DEFAULT_LOGGER.error(s)
+      elsif defined? LOGGER
+        LOGGER.error(s)
+      else
+        puts s
       end
-      
-    private 
-      def self.prepare_url(opts)
-        country = opts.delete(:country)
-        country = (country.nil?) ? 'us' : country
-        request_url = SERVICE_URLS[country.to_sym]
-        raise Amazon::RequestError, "Invalid country '#{country}'" unless request_url
-        
-        qs = ''
-        opts.each {|k,v|
-          next unless v
-          v = v.join(',') if v.is_a? Array
-          qs << "&#{camelize(k.to_s)}=#{URI.encode(v.to_s)}"
-        }
-        "#{request_url}#{qs}"
-      end
-      
-      def self.camelize(s)
-        s.to_s.gsub(/\/(.?)/) { "::" + $1.upcase }.gsub(/(^|_)(.)/) { $2.upcase }
-      end
+    end
+
+    private
+    def self.prepare_url(opts)
+      country = opts.delete(:country)
+      secret_key = opts.delete(:secret_key)
+      country = (country.nil?) ? 'us' : country
+      request_url = SERVICE_URLS[country.to_sym]
+      raise Amazon::RequestError, "Invalid country '#{country}'" unless request_url
+
+      qs = []
+      opts.each {|k,v|
+        next unless v
+        v = v.join(',') if v.is_a? Array
+        qs << "#{camelize(k.to_s)}=#{CGI.escape(v.to_s)}"
+      }
+      qs << DEFAULT_QUERY
+      qs << "Timestamp=" + CGI.escape(DateTime.now.new_offset.strftime('%Y-%m-%dT%XZ'))
+      domain = SERVICE_DOMAINS[country.to_sym]
+
+      params = qs.sort.join("&")
+      msg = ['GET', domain, SERVICE_PATH, params].join("\n")
+      dig = OpenSSL::HMAC::digest(OpenSSL::Digest::SHA256.new, secret_key, msg)
+      sig = CGI.escape(Base64.encode64(dig).chomp)
+      "http://#{domain}#{SERVICE_PATH}?#{params}&Signature=#{sig}"
+    end
+
+    def self.camelize(s)
+      s.to_s.gsub(/\/(.?)/) { "::" + $1.upcase }.gsub(/(^|_)(.)/) { $2.upcase }
+    end
   end
 
   # Internal wrapper class to provide convenient method to access Hpricot element value.
@@ -212,18 +234,18 @@ module Amazon
       @element = element
     end
 
-    # Returns Hpricot::Elments object    
+    # Returns Hpricot::Elments object
     def elem
       @element
     end
-    
+
     # Find Hpricot::Elements matching the given path. Example: element/"author".
     def /(path)
       elements = @element/path
       return nil if elements.size == 0
       elements
     end
-    
+
     # Find Hpricot::Elements matching the given path, and convert to Amazon::Element.
     # Returns an array Amazon::Elements if more than Hpricot::Elements size is greater than 1.
     def search_and_convert(path)
@@ -238,12 +260,12 @@ module Amazon
     def get(path='')
       Element.get(@element, path)
     end
-    
+
     # Get the unescaped HTML text of the given path.
     def get_unescaped(path='')
       Element.get_unescaped(@element, path)
     end
-    
+
     # Get the array values of the given path.
     def get_array(path='')
       Element.get_array(@element, path)
@@ -261,8 +283,8 @@ module Amazon
       result = result.inner_html if result
       result
     end
-    
-    # Similar to #get_unescaped, except an element object must be passed-in.    
+
+    # Similar to #get_unescaped, except an element object must be passed-in.
     def self.get_unescaped(element, path='')
       result = get(element, path)
       CGI::unescapeHTML(result) if result
@@ -271,7 +293,7 @@ module Amazon
     # Similar to #get_array, except an element object must be passed-in.
     def self.get_array(element, path='')
       return unless element
-      
+
       result = element/path
       if (result.is_a? Hpricot::Elements) || (result.is_a? Array)
         parsed_result = []
@@ -287,18 +309,18 @@ module Amazon
     # Similar to #get_hash, except an element object must be passed-in.
     def self.get_hash(element, path='')
       return unless element
-    
+
       result = element.at(path)
       if result
         hash = {}
         result = result.children
         result.each do |item|
           hash[item.name.to_sym] = item.inner_html
-        end 
+        end
         hash
       end
     end
-    
+
     def to_s
       elem.to_s if elem
     end
